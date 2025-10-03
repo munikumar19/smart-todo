@@ -106,7 +106,7 @@ const App = () => {
     setUserToken(token);
     
     const tempAuthAxios = axios.create({
-        baseURL: 'http://localhost:5000/api',
+        baseURL: BASE_API_DOMAIN,
         headers: { 'x-auth-token': token },
     });
     

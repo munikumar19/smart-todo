@@ -12,13 +12,18 @@ const JWT_SECRET = 'your_super_secret_key';
 app.use(cors());
 app.use(express.json());
 
-// Change this line to read an environment variable for security
-const MONGODB_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/smart-todo'; 
-// Note: When deploying, you will set MONGO_URI on Render.
+// --- CRITICAL DEPLOYMENT FIX: Direct Fallback to Verified Atlas URI ---
+// We embed the verified URI directly as a fallback. 
+// NOTE: Use munikumar25:smarttodo123 for the connection credentials.
+const ATLAS_URI_FALLBACK = 'mongodb+srv://munikumar25:smarttodo123@cluster0.jaxxykj.mongodb.net/smart-todo-prod?retryWrites=true&w=majority&authSource=admin';
+
+// Priority: Use environment variable first (MONGO_URI), then the verified fallback.
+const MONGODB_URI = process.env.MONGO_URI || ATLAS_URI_FALLBACK;
 
 mongoose.connect(MONGODB_URI)
     .then(() => console.log('MongoDB connected successfully'))
     .catch(err => console.log('MongoDB connection error:', err));
+// --- END FIX ---
 
 // --- Schemas and Models ---
 
@@ -29,6 +34,7 @@ const userSchema = new mongoose.Schema({
     createdAt: { type: Date, default: Date.now }
 });
 
+// Pre-save hook to hash password
 userSchema.pre('save', async function (next) {
     if (this.isModified('password')) {
         this.password = await bcrypt.hash(this.password, 10);
@@ -38,7 +44,7 @@ userSchema.pre('save', async function (next) {
 
 const User = mongoose.model('User', userSchema);
 
-// 2. Task Schema (UPDATED for isArchived)
+// 2. Task Schema
 const taskSchema = new mongoose.Schema({
     userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     title: { type: String, required: true },
@@ -51,12 +57,13 @@ const taskSchema = new mongoose.Schema({
     },
     createdAt: { type: Date, default: Date.now },
     completedAt: { type: Date },
-    isArchived: { type: Boolean, default: false } // NEW: Soft Delete Field
+    isArchived: { type: Boolean, default: false },
+    dueDate: { type: Date } 
 });
 
 const Task = mongoose.model('Task', taskSchema);
 
-// --- Auth Middleware ---
+// --- Auth Middleware (No Change) ---
 
 const auth = (req, res, next) => {
     const token = req.header('x-auth-token');
@@ -121,23 +128,21 @@ app.post('/api/auth/login', async (req, res) => {
     }
 });
 
-// --- Protected Task Routes (Updated for Archive/Recycle Bin) ---
+// --- Protected Task Routes (No Change) ---
 
 // 1. GET all tasks for the authenticated user
 app.get('/api/tasks', auth, async (req, res) => {
     try {
-        const { priority, completed, view } = req.query; // Added 'view' parameter
+        const { priority, completed, view } = req.query;
         
         const matchQuery = { userId: new mongoose.Types.ObjectId(req.userId) };
 
-        // Determine if we are viewing the main list or the recycle bin
         if (view === 'recycle_bin') {
             matchQuery.isArchived = true;
         } else {
-            matchQuery.isArchived = false; // Default: show non-archived tasks
+            matchQuery.isArchived = false;
         }
 
-        // Add optional filters from query parameters (only applies to main list)
         if (view !== 'recycle_bin') {
             if (priority && priority !== 'All') {
                 matchQuery.priority = priority;
@@ -147,7 +152,6 @@ app.get('/api/tasks', auth, async (req, res) => {
             }
         }
 
-        // 3. Build the aggregation pipeline with dynamic matching and sorting
         const tasks = await Task.aggregate([
             { $match: matchQuery }, 
             {
@@ -163,7 +167,6 @@ app.get('/api/tasks', auth, async (req, res) => {
                     }
                 }
             },
-            // Sort: incomplete first, then priority (High=1), then newest first
             { $sort: { completed: 1, priorityOrder: 1, createdAt: -1 } } 
         ]);
         res.json(tasks);
@@ -173,13 +176,14 @@ app.get('/api/tasks', auth, async (req, res) => {
     }
 });
 
-// 2. POST a new task (No Change)
+// 2. POST a new task
 app.post('/api/tasks', auth, async (req, res) => {
     const task = new Task({
         userId: req.userId,
         title: req.body.title,
         description: req.body.description,
         priority: req.body.priority || 'Medium',
+        dueDate: req.body.dueDate || null,
     });
     try {
         const newTask = await task.save();
@@ -189,7 +193,7 @@ app.post('/api/tasks', auth, async (req, res) => {
     }
 });
 
-// 3. UPDATE a task (now handles completion time AND restoration)
+// 3. UPDATE a task
 app.patch('/api/tasks/:id', auth, async (req, res) => {
     try {
         const task = await Task.findOne({ _id: req.params.id, userId: req.userId });
@@ -199,7 +203,7 @@ app.patch('/api/tasks/:id', auth, async (req, res) => {
         
         if (req.body.completed !== undefined) {
             task.completed = req.body.completed;
-            task.completedAt = req.body.completed ? new Date() : null; // Set/clear timestamp
+            task.completedAt = req.body.completed ? new Date() : null; 
         }
         
         if (req.body.priority) {
@@ -210,6 +214,10 @@ app.patch('/api/tasks/:id', auth, async (req, res) => {
              task.isArchived = req.body.isArchived;
         }
 
+        if (req.body.dueDate !== undefined) {
+             task.dueDate = req.body.dueDate; 
+        }
+
         const updatedTask = await task.save();
         res.json(updatedTask);
     } catch (err) {
@@ -217,9 +225,9 @@ app.patch('/api/tasks/:id', auth, async (req, res) => {
     }
 });
 
-// 4. SOFT DELETE (Archive) or PERMANENT DELETE a task
+// 4. DELETE a task
 app.delete('/api/tasks/:id', auth, async (req, res) => {
-    const { permanent } = req.query; // Check if permanent deletion is requested
+    const { permanent } = req.query; 
 
     try {
         const task = await Task.findOne({ _id: req.params.id, userId: req.userId });
@@ -228,11 +236,9 @@ app.delete('/api/tasks/:id', auth, async (req, res) => {
         }
         
         if (permanent === 'true' || task.isArchived) {
-            // PERMANENT DELETE (used in Recycle Bin)
             await task.deleteOne();
             return res.json({ message: 'Task permanently deleted' });
         } else {
-            // SOFT DELETE (Archive from main list)
             task.isArchived = true;
             await task.save();
             return res.json({ message: 'Task archived to recycle bin' });
